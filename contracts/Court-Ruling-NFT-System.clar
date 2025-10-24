@@ -8,9 +8,13 @@
 (define-constant err-unauthorized (err u103))
 (define-constant err-invalid-ruling (err u104))
 (define-constant err-restricted-access (err u105))
+(define-constant err-appeal-exists (err u106))
+(define-constant err-invalid-status (err u107))
+(define-constant err-ruling-not-found (err u108))
 
 (define-data-var token-counter uint u0)
 (define-data-var contract-paused bool false)
+(define-data-var appeal-counter uint u0)
 
 (define-map court-rulings uint {
     case-number: (string-ascii 50),
@@ -31,6 +35,24 @@
 (define-map ruling-metadata uint (string-utf8 500))
 (define-map case-to-token (string-ascii 50) uint)
 (define-map restricted-access uint bool)
+
+(define-map appeals uint {
+    appeal-id: uint,
+    original-ruling-id: uint,
+    appellant: principal,
+    appeal-court: (string-ascii 100),
+    appeal-case-number: (string-ascii 50),
+    appeal-grounds: (string-ascii 500),
+    filing-date: uint,
+    status: (string-ascii 20),
+    decision: (optional (string-ascii 500)),
+    decision-date: (optional uint),
+    filed-by: principal,
+    filed-at: uint
+})
+
+(define-map ruling-appeals uint (list 50 uint))
+(define-map appeal-status-history uint (list 20 {status: (string-ascii 20), updated-at: uint, updated-by: principal}))
 
 (define-public (mint-ruling
     (recipient principal)
@@ -183,3 +205,71 @@
             (match ruling-data
                 data (ok (some (get ruling-summary data)))
                 err-not-found))))
+
+(define-public (file-appeal
+    (original-ruling-id uint)
+    (appellant principal)
+    (appeal-court (string-ascii 100))
+    (appeal-case-number (string-ascii 50))
+    (appeal-grounds (string-ascii 500)))
+    (let ((appeal-id (+ (var-get appeal-counter) u1))
+          (ruling-data (unwrap! (map-get? court-rulings original-ruling-id) err-ruling-not-found))
+          (existing-appeals (default-to (list) (map-get? ruling-appeals original-ruling-id))))
+        (asserts! (not (var-get contract-paused)) err-unauthorized)
+        (asserts! (or (is-eq tx-sender contract-owner)
+                      (default-to false (map-get? authorized-minters tx-sender))) err-unauthorized)
+        (map-set appeals appeal-id {
+            appeal-id: appeal-id,
+            original-ruling-id: original-ruling-id,
+            appellant: appellant,
+            appeal-court: appeal-court,
+            appeal-case-number: appeal-case-number,
+            appeal-grounds: appeal-grounds,
+            filing-date: stacks-block-height,
+            status: "pending",
+            decision: none,
+            decision-date: none,
+            filed-by: tx-sender,
+            filed-at: stacks-block-height
+        })
+        (map-set appeal-status-history appeal-id (list {status: "pending", updated-at: stacks-block-height, updated-by: tx-sender}))
+        (map-set ruling-appeals original-ruling-id (unwrap-panic (as-max-len? (append existing-appeals appeal-id) u50)))
+        (var-set appeal-counter appeal-id)
+        (ok appeal-id)))
+
+(define-public (update-appeal-status
+    (appeal-id uint)
+    (new-status (string-ascii 20))
+    (decision (optional (string-ascii 500))))
+    (let ((appeal-data (unwrap! (map-get? appeals appeal-id) err-not-found))
+          (current-history (default-to (list) (map-get? appeal-status-history appeal-id))))
+        (asserts! (or (is-eq tx-sender contract-owner)
+                      (default-to false (map-get? authorized-minters tx-sender))) err-unauthorized)
+        (asserts! (not (var-get contract-paused)) err-unauthorized)
+        (map-set appeals appeal-id (merge appeal-data {
+            status: new-status,
+            decision: decision,
+            decision-date: (if (or (is-eq new-status "granted") (is-eq new-status "denied"))
+                              (some stacks-block-height)
+                              none)
+        }))
+        (map-set appeal-status-history appeal-id 
+            (unwrap-panic (as-max-len? 
+                (append current-history {status: new-status, updated-at: stacks-block-height, updated-by: tx-sender}) 
+                u20)))
+        (ok true)))
+
+(define-read-only (get-appeal (appeal-id uint))
+    (ok (map-get? appeals appeal-id)))
+
+(define-read-only (get-appeals-for-ruling (ruling-id uint))
+    (ok (map-get? ruling-appeals ruling-id)))
+
+(define-read-only (get-appeal-status-history (appeal-id uint))
+    (ok (map-get? appeal-status-history appeal-id)))
+
+(define-read-only (get-total-appeals)
+    (ok (var-get appeal-counter)))
+
+(define-read-only (get-appeal-count-for-ruling (ruling-id uint))
+    (ok (len (default-to (list) (map-get? ruling-appeals ruling-id)))))
