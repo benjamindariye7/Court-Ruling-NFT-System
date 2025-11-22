@@ -11,10 +11,13 @@
 (define-constant err-appeal-exists (err u106))
 (define-constant err-invalid-status (err u107))
 (define-constant err-ruling-not-found (err u108))
+(define-constant err-amendment-not-found (err u109))
+(define-constant err-amendment-pending (err u110))
 
 (define-data-var token-counter uint u0)
 (define-data-var contract-paused bool false)
 (define-data-var appeal-counter uint u0)
+(define-data-var amendment-counter uint u0)
 
 (define-map court-rulings uint {
     case-number: (string-ascii 50),
@@ -53,6 +56,24 @@
 
 (define-map ruling-appeals uint (list 50 uint))
 (define-map appeal-status-history uint (list 20 {status: (string-ascii 20), updated-at: uint, updated-by: principal}))
+
+(define-map amendments uint {
+    amendment-id: uint,
+    ruling-id: uint,
+    amendment-type: (string-ascii 50),
+    original-value: (string-ascii 500),
+    amended-value: (string-ascii 500),
+    reason: (string-ascii 500),
+    filed-by: principal,
+    filed-at: uint,
+    status: (string-ascii 20),
+    approved-by: (optional principal),
+    approved-at: (optional uint),
+    effective-date: uint
+})
+
+(define-map ruling-amendments uint (list 30 uint))
+(define-map amendment-history uint (list 10 {status: (string-ascii 20), updated-at: uint, updated-by: principal, note: (string-ascii 200)}))
 
 (define-public (mint-ruling
     (recipient principal)
@@ -273,3 +294,86 @@
 
 (define-read-only (get-appeal-count-for-ruling (ruling-id uint))
     (ok (len (default-to (list) (map-get? ruling-appeals ruling-id)))))
+
+(define-public (file-amendment
+    (ruling-id uint)
+    (amendment-type (string-ascii 50))
+    (original-value (string-ascii 500))
+    (amended-value (string-ascii 500))
+    (reason (string-ascii 500))
+    (effective-date uint))
+    (let ((amendment-id (+ (var-get amendment-counter) u1))
+          (ruling-data (unwrap! (map-get? court-rulings ruling-id) err-ruling-not-found))
+          (existing-amendments (default-to (list) (map-get? ruling-amendments ruling-id))))
+        (asserts! (not (var-get contract-paused)) err-unauthorized)
+        (asserts! (or (is-eq tx-sender contract-owner)
+                      (default-to false (map-get? authorized-minters tx-sender))) err-unauthorized)
+        (asserts! (> effective-date u0) err-invalid-ruling)
+        (map-set amendments amendment-id {
+            amendment-id: amendment-id,
+            ruling-id: ruling-id,
+            amendment-type: amendment-type,
+            original-value: original-value,
+            amended-value: amended-value,
+            reason: reason,
+            filed-by: tx-sender,
+            filed-at: stacks-block-height,
+            status: "pending",
+            approved-by: none,
+            approved-at: none,
+            effective-date: effective-date
+        })
+        (map-set amendment-history amendment-id (list {status: "pending", updated-at: stacks-block-height, updated-by: tx-sender, note: "Amendment filed"}))
+        (map-set ruling-amendments ruling-id (unwrap-panic (as-max-len? (append existing-amendments amendment-id) u30)))
+        (var-set amendment-counter amendment-id)
+        (ok amendment-id)))
+
+(define-public (approve-amendment (amendment-id uint))
+    (let ((amendment-data (unwrap! (map-get? amendments amendment-id) err-amendment-not-found))
+          (current-history (default-to (list) (map-get? amendment-history amendment-id))))
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (not (var-get contract-paused)) err-unauthorized)
+        (asserts! (is-eq (get status amendment-data) "pending") err-invalid-status)
+        (map-set amendments amendment-id (merge amendment-data {
+            status: "approved",
+            approved-by: (some tx-sender),
+            approved-at: (some stacks-block-height)
+        }))
+        (map-set amendment-history amendment-id 
+            (unwrap-panic (as-max-len? 
+                (append current-history {status: "approved", updated-at: stacks-block-height, updated-by: tx-sender, note: "Amendment approved"})
+                u10)))
+        (ok true)))
+
+(define-public (reject-amendment (amendment-id uint) (rejection-note (string-ascii 200)))
+    (let ((amendment-data (unwrap! (map-get? amendments amendment-id) err-amendment-not-found))
+          (current-history (default-to (list) (map-get? amendment-history amendment-id))))
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (not (var-get contract-paused)) err-unauthorized)
+        (asserts! (is-eq (get status amendment-data) "pending") err-invalid-status)
+        (map-set amendments amendment-id (merge amendment-data {
+            status: "rejected"
+        }))
+        (map-set amendment-history amendment-id 
+            (unwrap-panic (as-max-len? 
+                (append current-history {status: "rejected", updated-at: stacks-block-height, updated-by: tx-sender, note: rejection-note})
+                u10)))
+        (ok true)))
+
+(define-read-only (get-amendment (amendment-id uint))
+    (ok (map-get? amendments amendment-id)))
+
+(define-read-only (get-amendments-for-ruling (ruling-id uint))
+    (ok (map-get? ruling-amendments ruling-id)))
+
+(define-read-only (get-amendment-history (amendment-id uint))
+    (ok (map-get? amendment-history amendment-id)))
+
+(define-read-only (get-total-amendments)
+    (ok (var-get amendment-counter)))
+
+(define-read-only (get-amendment-count-for-ruling (ruling-id uint))
+    (ok (len (default-to (list) (map-get? ruling-amendments ruling-id)))))
+
+(define-read-only (get-pending-amendments-for-ruling (ruling-id uint))
+    (ok (map-get? ruling-amendments ruling-id)))
